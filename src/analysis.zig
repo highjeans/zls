@@ -151,6 +151,183 @@ pub fn collectDocComments(allocator: std.mem.Allocator, tree: Ast, doc_comments:
     return try std.mem.join(allocator, "\n", lines.items);
 }
 
+const zls_type_hint_prefix = "// zls type:";
+
+// Normal line comments are skipped by the Zig AST, so type hints have to be
+// read from the raw source line immediately before the variable declaration.
+fn getZlsTypeHintBeforeVarDecl(tree: Ast, var_decl: Ast.full.VarDecl) ?[]const u8 {
+    const source = tree.source;
+    const decl_start = tree.tokenStart(var_decl.ast.mut_token);
+    const decl_line_start = if (std.mem.lastIndexOfScalar(u8, source[0..decl_start], '\n')) |newline|
+        newline + 1
+    else
+        0;
+
+    if (decl_line_start == 0) return null;
+
+    var hint_line_end = decl_line_start - 1;
+    if (hint_line_end > 0 and source[hint_line_end - 1] == '\r') {
+        hint_line_end -= 1;
+    }
+
+    const hint_line_start = if (std.mem.lastIndexOfScalar(u8, source[0..hint_line_end], '\n')) |newline|
+        newline + 1
+    else
+        0;
+
+    const hint_line = std.mem.trimLeft(u8, source[hint_line_start..hint_line_end], " \t");
+    if (!std.mem.startsWith(u8, hint_line, zls_type_hint_prefix)) return null;
+
+    const hint = std.mem.trim(u8, hint_line[zls_type_hint_prefix.len..], &std.ascii.whitespace);
+    return if (hint.len == 0) null else hint;
+}
+
+fn consumeTypeHintKeyword(text: []const u8, keyword: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, text, keyword)) return null;
+    if (text.len != keyword.len and !std.ascii.isWhitespace(text[keyword.len])) return null;
+    return std.mem.trimLeft(u8, text[keyword.len..], &std.ascii.whitespace);
+}
+
+fn resolveZlsTypeHint(
+    analyser: *Analyser,
+    handle: *DocumentStore.Handle,
+    source_index: usize,
+    hint: []const u8,
+) error{OutOfMemory}!?Type {
+    const type_value = try analyser.resolveZlsTypeHintTypeValue(handle, source_index, hint) orelse return null;
+    return try type_value.instanceTypeVal(analyser);
+}
+
+// This intentionally accepts a small type-expression subset that is useful for
+// annotations while still resolving names through the normal ZLS symbol tables.
+fn resolveZlsTypeHintTypeValue(
+    analyser: *Analyser,
+    handle: *DocumentStore.Handle,
+    source_index: usize,
+    hint: []const u8,
+) error{OutOfMemory}!?Type {
+    const text = std.mem.trim(u8, hint, &std.ascii.whitespace);
+    if (text.len == 0) return null;
+
+    if (text[0] == '?') {
+        const child = try analyser.resolveZlsTypeHintTypeValue(handle, source_index, text[1..]) orelse return null;
+        return .{
+            .data = .{ .optional = try analyser.allocType(child) },
+            .is_type_val = true,
+        };
+    }
+
+    if (std.mem.startsWith(u8, text, "*")) {
+        const child_text, const is_const = consumeZlsTypeHintConst(text[1..]);
+        const child = try analyser.resolveZlsTypeHintTypeValue(handle, source_index, child_text) orelse return null;
+        return .{
+            .data = .{ .pointer = .{
+                .size = .one,
+                .sentinel = .none,
+                .is_const = is_const,
+                .elem_ty = try analyser.allocType(child),
+            } },
+            .is_type_val = true,
+        };
+    }
+
+    if (std.mem.startsWith(u8, text, "[]")) {
+        const child_text, const is_const = consumeZlsTypeHintConst(text[2..]);
+        const child = try analyser.resolveZlsTypeHintTypeValue(handle, source_index, child_text) orelse return null;
+        return .{
+            .data = .{ .pointer = .{
+                .size = .slice,
+                .sentinel = .none,
+                .is_const = is_const,
+                .elem_ty = try analyser.allocType(child),
+            } },
+            .is_type_val = true,
+        };
+    }
+
+    if (std.mem.startsWith(u8, text, "[*]")) {
+        const child_text, const is_const = consumeZlsTypeHintConst(text[3..]);
+        const child = try analyser.resolveZlsTypeHintTypeValue(handle, source_index, child_text) orelse return null;
+        return .{
+            .data = .{ .pointer = .{
+                .size = .many,
+                .sentinel = .none,
+                .is_const = is_const,
+                .elem_ty = try analyser.allocType(child),
+            } },
+            .is_type_val = true,
+        };
+    }
+
+    if (std.mem.startsWith(u8, text, "[*c]")) {
+        const child_text, const is_const = consumeZlsTypeHintConst(text[4..]);
+        const child = try analyser.resolveZlsTypeHintTypeValue(handle, source_index, child_text) orelse return null;
+        return .{
+            .data = .{ .pointer = .{
+                .size = .c,
+                .sentinel = .none,
+                .is_const = is_const,
+                .elem_ty = try analyser.allocType(child),
+            } },
+            .is_type_val = true,
+        };
+    }
+
+    return try analyser.resolveZlsTypeHintNamedType(handle, source_index, text);
+}
+
+fn consumeZlsTypeHintConst(text: []const u8) struct { []const u8, bool } {
+    const trimmed = std.mem.trimLeft(u8, text, &std.ascii.whitespace);
+    if (consumeTypeHintKeyword(trimmed, "const")) |child_text| return .{ child_text, true };
+    return .{ trimmed, false };
+}
+
+fn resolveZlsTypeHintNamedType(
+    analyser: *Analyser,
+    handle: *DocumentStore.Handle,
+    source_index: usize,
+    hint: []const u8,
+) error{OutOfMemory}!?Type {
+    const hint_z = try analyser.arena.dupeZ(u8, hint);
+    var tokenizer: std.zig.Tokenizer = .init(hint_z);
+
+    const first = tokenizer.next();
+    if (first.tag != .identifier or first.loc.start != 0) return null;
+
+    const first_name = offsets.identifierIndexToSlice(hint_z, first.loc.start, .name);
+    var current_type = try analyser.resolveZlsTypeHintRootName(handle, source_index, first_name) orelse return null;
+
+    while (true) {
+        const dot = tokenizer.next();
+        switch (dot.tag) {
+            .eof => return current_type,
+            .period => {},
+            else => return null,
+        }
+
+        const name_token = tokenizer.next();
+        if (name_token.tag != .identifier) return null;
+
+        const name = offsets.identifierIndexToSlice(hint_z, name_token.loc.start, .name);
+        const decl = try current_type.lookupSymbol(analyser, name) orelse return null;
+        current_type = try decl.resolveType(analyser) orelse return null;
+    }
+}
+
+fn resolveZlsTypeHintRootName(
+    analyser: *Analyser,
+    handle: *DocumentStore.Handle,
+    source_index: usize,
+    name: []const u8,
+) error{OutOfMemory}!?Type {
+    if (try analyser.resolvePrimitive(name)) |primitive| {
+        return Type.fromIP(analyser, analyser.ip.typeOf(primitive), primitive);
+    }
+
+    const decl = try analyser.lookupSymbolGlobal(handle, name, source_index) orelse return null;
+    return try decl.resolveType(analyser);
+}
+
 /// Gets a function's keyword, name, arguments and return value.
 pub fn getFunctionSignature(tree: Ast, func: Ast.full.FnProto) []const u8 {
     const first_token = func.ast.fn_token;
@@ -1904,6 +2081,13 @@ fn resolveTypeOfNodeUncached(analyser: *Analyser, options: ResolveOptions) error
                     break :blk;
                 }
                 return try decl_type.instanceTypeVal(analyser);
+            }
+
+            if (getZlsTypeHintBeforeVarDecl(tree, var_decl)) |hint| {
+                const hint_source_index = tree.tokenStart(var_decl.ast.mut_token);
+                if (try analyser.resolveZlsTypeHint(handle, hint_source_index, hint)) |hinted_type| {
+                    return hinted_type;
+                }
             }
 
             if (var_decl.ast.init_node.unwrap()) |init_node| blk: {
